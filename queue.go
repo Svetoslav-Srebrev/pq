@@ -1,0 +1,215 @@
+package pq
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+)
+
+const (
+	segmentSize = 331
+
+	fClear   = uint32(0)
+	fWaiting = uint32(1)
+	fReady   = uint32(2)
+)
+
+type slot[V any] struct {
+	data V
+	flag atomic.Uint32
+}
+
+type segment[V any] struct {
+	slots  [segmentSize]slot[V]
+	write  atomic.Uint64
+	next   atomic.Pointer[segment[V]]
+	id     uint64
+	offset uint64
+}
+
+type Writer[V any] struct {
+	writeSegment atomic.Pointer[segment[V]]
+	mutex        *sync.Mutex
+	chReady      chan struct{}
+}
+
+type Reader[V any] struct {
+	segment   *segment[V]
+	readIndex uint64
+	chReady   <-chan struct{}
+	_padding  uint64
+}
+
+func NewQueue[V any]() (*Writer[V], *Reader[V]) {
+	chReady := make(chan struct{}, 1)
+	seg := &segment[V]{}
+
+	qw := &Writer[V]{chReady: chReady, mutex: &sync.Mutex{}}
+	qw.writeSegment.Store(seg)
+
+	qr := &Reader[V]{chReady: chReady, segment: seg, readIndex: 0}
+	return qw, qr
+}
+
+func (q *Writer[V]) Enqueue(value V) {
+	q.enqueue(value)
+}
+
+func (q *Writer[V]) EnqueueWithIndex(value V) uint64 {
+	seg, index := q.enqueue(value)
+	return seg.offset + index
+}
+
+func (qr *Reader[V]) Dequeue() V {
+	_, val, _ := qr.dequeue(true)
+	return val
+}
+
+func (qr *Reader[V]) DequeueWithIndex() (uint64, V) {
+	index, val, _ := qr.dequeue(true)
+	return index, val
+}
+
+func (qr *Reader[V]) TryDequeue() (V, bool) {
+	_, val, success := qr.dequeue(false)
+	return val, success
+}
+
+func (qr *Reader[V]) TryDequeueWithIndex() (uint64, V, bool) {
+	return qr.dequeue(false)
+}
+
+func (qr *Reader[V]) DequeueCtx(ctx context.Context) (V, error) {
+	_, val, err := qr.dequeueCtx(ctx)
+	return val, err
+}
+
+func (qr *Reader[V]) DequeueCtxWithIndex(ctx context.Context) (uint64, V, error) {
+	return qr.dequeueCtx(ctx)
+}
+
+func (q *Writer[V]) enqueue(value V) (*segment[V], uint64) {
+	seg := q.writeSegment.Load()
+	var index uint64
+	for {
+		index = seg.write.Add(1) - 1
+		if index < segmentSize {
+			if index == segmentSize-1 {
+				q.setNextAndWriteSegment(seg)
+			}
+			break
+		} else {
+			seg = q.getNextWriteSegment(seg.id)
+		}
+	}
+
+	seg.slots[index].data = value
+	prev := seg.slots[index].flag.Swap(fReady)
+	if prev == fWaiting {
+		q.chReady <- struct{}{}
+	}
+	return seg, index
+}
+
+func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
+	if qr.readIndex == segmentSize {
+		// qr.segment.next is never nil because previous segment slot seg.slots[segmentSize-1].flag
+		// was set which happens AFTER seg.next is set. See Enqueue method
+		next := qr.segment.next.Load()
+		qr.segment = next
+		qr.readIndex = 0
+	}
+
+	// index < segmentSize
+	if qr.segment.slots[qr.readIndex].flag.Load() != fReady {
+		if !block {
+			var zeroValue V
+			return 0, zeroValue, false
+		}
+
+		prev := qr.segment.slots[qr.readIndex].flag.Swap(fWaiting)
+		if prev != fReady {
+			<-qr.chReady
+		}
+	}
+
+	index := qr.readIndex
+	qr.readIndex += 1
+	return qr.segment.offset + index, qr.segment.slots[index].data, true
+}
+
+func (qr *Reader[V]) dequeueCtx(ctx context.Context) (uint64, V, error) {
+	if qr.readIndex == segmentSize {
+		// qr.segment.next is never nil because previous segment slot seg.slots[segmentSize-1].flag
+		// was set which happens AFTER seg.next is set. See Enqueue method
+		next := qr.segment.next.Load()
+		qr.segment = next
+		qr.readIndex = 0
+	}
+
+	// index < segmentSize
+	if qr.segment.slots[qr.readIndex].flag.Load() != fReady {
+
+		prev := qr.segment.slots[qr.readIndex].flag.Swap(fWaiting)
+		if prev != fReady {
+			select {
+			case <-ctx.Done():
+				prev = qr.segment.slots[qr.readIndex].flag.Swap(fClear)
+				if prev != fReady {
+					err := ctx.Err()
+					if err == nil {
+						// ctx.Done() is closed/signalled but, but ctx.Err() is nil? context.Context interface custom implementation bug?
+						err = errors.New("operation canceled")
+					}
+
+					var zeroValue V
+					return 0, zeroValue, err
+				}
+				// prev == fReady. The item was set concurrently with ctx.Done() channel.
+				// Consume qr.chReady and pretend we noticed qr.chReady first
+				<-qr.chReady
+			case <-qr.chReady:
+			}
+		}
+	}
+
+	index := qr.readIndex
+	qr.readIndex += 1
+	return qr.segment.offset + index, qr.segment.slots[index].data, nil
+}
+
+func (q *Writer[V]) setNextAndWriteSegment(seg *segment[V]) {
+	q.mutex.Lock()
+	next := seg.next.Load()
+	if next == nil {
+		next = &segment[V]{}
+		next.id = seg.id + 1
+		next.offset = next.id * segmentSize
+		seg.next.Store(next)
+		q.writeSegment.Store(next)
+	}
+	q.mutex.Unlock()
+}
+
+func (q *Writer[V]) getNextWriteSegment(id uint64) *segment[V] {
+	var seg *segment[V]
+	q.mutex.Lock()
+	writeSegment := q.writeSegment.Load()
+	if writeSegment.id == id {
+		if writeSegment.next.Load() != nil {
+			panic("pq: invalid next segment")
+		}
+
+		seg = &segment[V]{}
+		seg.id = writeSegment.id + 1
+		seg.offset = seg.id * segmentSize
+		writeSegment.next.Store(seg)
+		q.writeSegment.Store(seg)
+	} else {
+		seg = writeSegment
+	}
+	q.mutex.Unlock()
+
+	return seg
+}
