@@ -7,7 +7,7 @@ import (
 )
 
 // var concurrencyTests = []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 50, 100, 1000, 10_000, 100_000, 1_000_000}
-var concurrencyTests = []int{1, 16, 1000, 100_000}
+var concurrencyTests = []int{1, 8, 16, 1000, 100_000}
 
 func splitTotal(total, concurrency int) (int, int) {
 	if concurrency > total {
