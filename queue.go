@@ -51,11 +51,11 @@ type slot[V any] struct {
 }
 
 type segment[V any] struct {
-	slots  [segmentSize]slot[V]
-	write  atomic.Uint64
-	next   atomic.Pointer[segment[V]]
-	id     uint64
-	offset uint64
+	slots      [segmentSize]slot[V]
+	writeIndex atomic.Uint64
+	next       atomic.Pointer[segment[V]]
+	id         uint64
+	offset     uint64
 }
 
 type Writer[V any] struct {
@@ -82,12 +82,12 @@ func NewQueue[V any]() (*Writer[V], *Reader[V]) {
 	return qw, qr
 }
 
-func (q *Writer[V]) Enqueue(value V) {
-	q.enqueue(value)
+func (qw *Writer[V]) Enqueue(value V) {
+	qw.enqueue(value)
 }
 
-func (q *Writer[V]) EnqueueWithIndex(value V) uint64 {
-	seg, index := q.enqueue(value)
+func (qw *Writer[V]) EnqueueWithIndex(value V) uint64 {
+	seg, index := qw.enqueue(value)
 	return seg.offset + index
 }
 
@@ -119,25 +119,25 @@ func (qr *Reader[V]) DequeueCtxWithIndex(ctx context.Context) (uint64, V, error)
 	return qr.dequeueCtx(ctx)
 }
 
-func (q *Writer[V]) enqueue(value V) (*segment[V], uint64) {
-	seg := q.writeSegment.Load()
+func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
+	seg := qw.writeSegment.Load()
 	var index uint64
 	for {
-		index = seg.write.Add(1) - 1
+		index = seg.writeIndex.Add(1) - 1
 		if index < segmentSize {
 			if index == segmentSize-1 {
-				q.setNextAndWriteSegment(seg)
+				qw.setNextAndWriteSegment(seg)
 			}
 			break
 		} else {
-			seg = q.getNextWriteSegment(seg.id)
+			seg = qw.getNextWriteSegment(seg.id)
 		}
 	}
 
 	seg.slots[index].data = value
 	prev := seg.slots[index].flag.Swap(fReady)
 	if prev == fWaiting {
-		q.chReady <- struct{}{}
+		qw.chReady <- struct{}{}
 	}
 	return seg, index
 }
@@ -209,23 +209,23 @@ func (qr *Reader[V]) dequeueCtx(ctx context.Context) (uint64, V, error) {
 	return qr.segment.offset + index, qr.segment.slots[index].data, nil
 }
 
-func (q *Writer[V]) setNextAndWriteSegment(seg *segment[V]) {
-	q.mutex.Lock()
+func (qw *Writer[V]) setNextAndWriteSegment(seg *segment[V]) {
+	qw.mutex.Lock()
 	next := seg.next.Load()
 	if next == nil {
 		next = &segment[V]{}
 		next.id = seg.id + 1
 		next.offset = next.id * segmentSize
 		seg.next.Store(next)
-		q.writeSegment.Store(next)
+		qw.writeSegment.Store(next)
 	}
-	q.mutex.Unlock()
+	qw.mutex.Unlock()
 }
 
-func (q *Writer[V]) getNextWriteSegment(id uint64) *segment[V] {
+func (qw *Writer[V]) getNextWriteSegment(id uint64) *segment[V] {
 	var seg *segment[V]
-	q.mutex.Lock()
-	writeSegment := q.writeSegment.Load()
+	qw.mutex.Lock()
+	writeSegment := qw.writeSegment.Load()
 	if writeSegment.id == id {
 		if writeSegment.next.Load() != nil {
 			panic("pq: invalid next segment")
@@ -235,11 +235,11 @@ func (q *Writer[V]) getNextWriteSegment(id uint64) *segment[V] {
 		seg.id = writeSegment.id + 1
 		seg.offset = seg.id * segmentSize
 		writeSegment.next.Store(seg)
-		q.writeSegment.Store(seg)
+		qw.writeSegment.Store(seg)
 	} else {
 		seg = writeSegment
 	}
-	q.mutex.Unlock()
+	qw.mutex.Unlock()
 
 	return seg
 }
