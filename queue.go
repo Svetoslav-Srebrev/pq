@@ -171,8 +171,8 @@ func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
 
 func (qr *Reader[V]) dequeueCtx(ctx context.Context) (uint64, V, error) {
 	if qr.readIndex == segmentSize {
-		// qr.segment.next is never nil because previous segment slot seg.slots[segmentSize-1].flag
-		// was set which happens AFTER seg.next is set. See Enqueue method
+		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
+		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
 		qr.segment = next
 		qr.readIndex = 0
