@@ -28,22 +28,22 @@ func BenchmarkEnqueuePQueue(b *testing.B) {
 	}
 }
 
-func BenchmarkEnqueueChFixed(b *testing.B) {
-	for _, v := range concurrencyTests {
-		concur := v
-		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
-			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
-			enqueueCh(concurrency, itemsPerGoroutine, 10)
-		})
-	}
-}
-
 func BenchmarkEnqueueChUnbound(b *testing.B) {
 	for _, v := range concurrencyTests {
 		concur := v
 		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
 			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
 			enqueueCh(concurrency, itemsPerGoroutine, concurrency*itemsPerGoroutine)
+		})
+	}
+}
+
+func BenchmarkEnqueueChFixed(b *testing.B) {
+	for _, v := range concurrencyTests {
+		concur := v
+		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
+			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
+			enqueueCh(concurrency, itemsPerGoroutine, 10)
 		})
 	}
 }

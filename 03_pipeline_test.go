@@ -40,21 +40,6 @@ func (r *mutexResource) do() {
 	r.mu.Unlock()
 }
 
-func BenchmarkPipelineAtomic(b *testing.B) {
-	var actions []resource
-	for i := 0; i < pipelineSteps; i++ {
-		actions = append(actions, &atomicResource{})
-	}
-
-	for _, v := range concurrencyTests {
-		concur := v
-		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
-			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
-			pipelineConcurrent(concurrency, itemsPerGoroutine, actions)
-		})
-	}
-}
-
 func BenchmarkPipelinePQ(b *testing.B) {
 	var actions []resource
 	for i := 0; i < pipelineSteps; i++ {
@@ -81,6 +66,21 @@ func BenchmarkPipelineCh(b *testing.B) {
 		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
 			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
 			pipelineCh(concurrency, itemsPerGoroutine, actions)
+		})
+	}
+}
+
+func BenchmarkPipelineAtomic(b *testing.B) {
+	var actions []resource
+	for i := 0; i < pipelineSteps; i++ {
+		actions = append(actions, &atomicResource{})
+	}
+
+	for _, v := range concurrencyTests {
+		concur := v
+		b.Run(fmt.Sprintf("concurrency_%d", concur), func(b *testing.B) {
+			concurrency, itemsPerGoroutine := splitTotal(b.N, concur)
+			pipelineConcurrent(concurrency, itemsPerGoroutine, actions)
 		})
 	}
 }
