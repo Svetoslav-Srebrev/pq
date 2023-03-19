@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-const pipelineSteps = 3
+const pipelineSteps = 1
 
 type resource interface {
 	do()
