@@ -4,7 +4,6 @@
 package pq
 
 import (
-	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -37,24 +36,56 @@ type Writer[V any] struct {
 	writeSegment atomic.Pointer[segment[V]]
 	mutex        *sync.Mutex
 	chReady      chan struct{}
+	stat         *pendingCounter
 }
 
 type Reader[V any] struct {
 	segment   *segment[V]
 	readIndex uint64
 	chReady   <-chan struct{}
-	_padding  uint64
+	stat      *pendingCounter
+	_padding1 uint64
+}
+
+type pendingCounter struct {
+	batch   int64
+	counter atomic.Int64
+}
+
+func (p *pendingCounter) getCount() int {
+	if p == nil {
+		return -1
+	}
+	pending := p.counter.Load()
+	if pending < 0 {
+		return 0
+	}
+
+	return int(pending)
 }
 
 func NewQueue[V any]() (*Writer[V], *Reader[V]) {
+	return NewQueueWithStat[V](0)
+}
+
+func NewQueueWithStat[V any](batchIncrement int) (*Writer[V], *Reader[V]) {
 	chReady := make(chan struct{}, 1)
 	seg := &segment[V]{}
 
-	qw := &Writer[V]{chReady: chReady, mutex: &sync.Mutex{}}
+	var pc *pendingCounter
+	if batchIncrement > 0 {
+		pc = &pendingCounter{batch: int64(batchIncrement)}
+	}
+
+	qw := &Writer[V]{chReady: chReady, mutex: &sync.Mutex{}, stat: pc}
 	qw.writeSegment.Store(seg)
 
-	qr := &Reader[V]{chReady: chReady, segment: seg, readIndex: 0}
+	qr := &Reader[V]{chReady: chReady, segment: seg, readIndex: 0, stat: pc}
 	return qw, qr
+}
+
+func (qw *Writer[V]) Pending() int {
+	return qw.stat.getCount()
 }
 
 func (qw *Writer[V]) Enqueue(value V) {
@@ -64,6 +95,10 @@ func (qw *Writer[V]) Enqueue(value V) {
 func (qw *Writer[V]) EnqueueWithIndex(value V) uint64 {
 	seg, index := qw.enqueue(value)
 	return seg.offset + index
+}
+
+func (qr *Reader[V]) Pending() int {
+	return qr.stat.getCount()
 }
 
 func (qr *Reader[V]) Dequeue() V {
@@ -76,40 +111,15 @@ func (qr *Reader[V]) DequeueWithIndex() (uint64, V) {
 	return index, val
 }
 
-func (qr *Reader[V]) TryDequeue() (V, bool) {
-	_, val, success := qr.dequeue(false)
-	return val, success
-}
-
-func (qr *Reader[V]) TryDequeueWithIndex() (uint64, V, bool) {
+func (qr *Reader[V]) TryDequeue() (uint64, V, bool) {
 	return qr.dequeue(false)
 }
 
-func (qr *Reader[V]) DequeueCtx(ctx context.Context) (V, error) {
-	_, val, err := qr.DequeueCtxWithIndex(ctx)
-	return val, err
-}
-
-func (qr *Reader[V]) DequeueCtxWithIndex(ctx context.Context) (uint64, V, error) {
-	index, val, err := TryDequeue(qr, ctx.Done())
-	if err != nil {
-		contextErr := ctx.Err()
-		if contextErr != nil {
-			err = contextErr
-		}
-	}
-
-	return index, val, err
-}
-
-func TryDequeue[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, error) {
+func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, error) {
 	if qr.readIndex == segmentSize {
 		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
 		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
-		if next == nil {
-			panic("nil next segment")
-		}
 		qr.segment = next
 		qr.readIndex = 0
 	}
@@ -137,34 +147,16 @@ func TryDequeue[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, error) {
 
 	index := qr.readIndex
 	qr.readIndex += 1
-	return qr.segment.offset + index, qr.segment.slots[index].data, nil
-}
+	offset := qr.segment.offset + index
 
-func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
-	seg := qw.writeSegment.Load()
-	var index uint64
-	for {
-		index = seg.writeIndex.Add(1) - 1
-		if index < segmentSize {
-			if index == segmentSize-1 {
-
-				qw.setNextSegment(seg)
-				//qw.setNextSegmentLockFree(seg)
-			}
-			break
-		} else {
-
-			seg = qw.setNextSegment(seg)
-			//seg = qw.setNextSegmentLockFree(seg)
+	if qr.stat != nil {
+		items := offset + 1
+		if items%uint64(qr.stat.batch) == 0 {
+			qr.stat.counter.Add(-qr.stat.batch)
 		}
 	}
 
-	seg.slots[index].data = value
-	prev := seg.slots[index].flag.Swap(fReady)
-	if prev == fWaiting {
-		qw.chReady <- struct{}{}
-	}
-	return seg, index
+	return offset, qr.segment.slots[index].data, nil
 }
 
 func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
@@ -191,7 +183,51 @@ func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
 
 	index := qr.readIndex
 	qr.readIndex += 1
-	return qr.segment.offset + index, qr.segment.slots[index].data, true
+	offset := qr.segment.offset + index
+
+	if qr.stat != nil {
+		items := offset + 1
+		if items%uint64(qr.stat.batch) == 0 {
+			qr.stat.counter.Add(-qr.stat.batch)
+		}
+	}
+
+	return offset, qr.segment.slots[index].data, true
+}
+
+func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
+	seg := qw.writeSegment.Load()
+	var index uint64
+	for {
+		index = seg.writeIndex.Add(1) - 1
+		if index < segmentSize {
+			if index == segmentSize-1 {
+
+				qw.setNextSegment(seg)
+				//qw.setNextSegmentLockFree(seg)
+			}
+			break
+		} else {
+
+			seg = qw.setNextSegment(seg)
+			//seg = qw.setNextSegmentLockFree(seg)
+		}
+	}
+
+	seg.slots[index].data = value
+	prev := seg.slots[index].flag.Swap(fReady)
+	if prev == fWaiting {
+		qw.chReady <- struct{}{}
+	}
+
+	if qw.stat != nil {
+		items := seg.offset + index + 1
+		if items%uint64(qw.stat.batch) == 0 {
+			qw.stat.counter.Add(qw.stat.batch)
+		}
+	}
+
+	return seg, index
 }
 
 func (qw *Writer[V]) setNextSegment(seg *segment[V]) *segment[V] {

@@ -53,7 +53,7 @@ func enqueuePQ(concurrency, itemsPerGoroutine int) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	qw, qr := NewQueue[struct{}]()
+	qw, qr := NewQueueWithStat[struct{}](0)
 	go func() {
 		counter := 0
 		for {

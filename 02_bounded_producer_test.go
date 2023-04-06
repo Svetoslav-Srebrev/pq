@@ -49,7 +49,7 @@ func enqueueBP(concurrency, itemsPerGoroutine int) {
 			inflightBatch := 0
 			for i := 0; i < itemsPerGoroutine; i++ {
 				if inflightBatch == maxPendingBatch {
-					for _, ok := completeQR.TryDequeue(); inflightBatch > 0 && ok; _, ok = completeQR.TryDequeue() {
+					for _, _, ok := completeQR.TryDequeue(); inflightBatch > 0 && ok; _, _, ok = completeQR.TryDequeue() {
 						inflightBatch--
 					}
 
