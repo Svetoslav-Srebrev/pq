@@ -52,16 +52,12 @@ type pendingCounter struct {
 	counter atomic.Int64
 }
 
-func (p *pendingCounter) getCount() int {
-	if p == nil {
+func (pc *pendingCounter) getCount() int {
+	if pc == nil {
 		return -1
 	}
-	pending := p.counter.Load()
-	if pending < 0 {
-		return 0
-	}
 
-	return int(pending)
+	return int(pc.counter.Load())
 }
 
 func NewQueue[V any]() (*Writer[V], *Reader[V]) {
@@ -214,17 +210,17 @@ func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
 		}
 	}
 
-	seg.slots[index].data = value
-	prev := seg.slots[index].flag.Swap(fReady)
-	if prev == fWaiting {
-		qw.chReady <- struct{}{}
-	}
-
 	if qw.stat != nil {
 		items := seg.offset + index + 1
 		if items%uint64(qw.stat.batch) == 0 {
 			qw.stat.counter.Add(qw.stat.batch)
 		}
+	}
+
+	seg.slots[index].data = value
+	prev := seg.slots[index].flag.Swap(fReady)
+	if prev == fWaiting {
+		qw.chReady <- struct{}{}
 	}
 
 	return seg, index
