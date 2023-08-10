@@ -53,11 +53,11 @@ func enqueuePQ(concurrency, itemsPerGoroutine int) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	qw, qr := NewQueueWithStat[struct{}](0)
+	q := NewQueueWithStat[struct{}](0)
 	go func() {
 		counter := 0
 		for {
-			qr.Dequeue()
+			q.Reader.Dequeue()
 			counter++
 
 			if counter == total {
@@ -70,7 +70,7 @@ func enqueuePQ(concurrency, itemsPerGoroutine int) {
 	for c := 0; c < concurrency; c++ {
 		go func() {
 			for i := 0; i < itemsPerGoroutine; i++ {
-				qw.Enqueue(struct{}{})
+				q.Writer.Enqueue(struct{}{})
 			}
 		}()
 	}

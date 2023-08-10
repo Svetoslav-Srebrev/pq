@@ -21,11 +21,11 @@ func enqueueBP(concurrency, itemsPerGoroutine int) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	destQW, destQR := NewQueue[*Writer[struct{}]]()
+	destQ := NewQueue[*Writer[struct{}]]()
 	go func() {
 		counter := 0
 		for {
-			completeQW := destQR.Dequeue()
+			completeQW := destQ.Reader.Dequeue()
 			counter++
 			if completeQW != nil {
 				completeQW.Enqueue(struct{}{})
@@ -43,18 +43,18 @@ func enqueueBP(concurrency, itemsPerGoroutine int) {
 
 	for c := 0; c < concurrency; c++ {
 		go func() {
-			completeQW, completeQR := NewQueue[struct{}]()
+			completeQ := NewQueue[struct{}]()
 
 			sendCounter := 0
 			inflightBatch := 0
 			for i := 0; i < itemsPerGoroutine; i++ {
 				if inflightBatch == maxPendingBatch {
-					for _, _, ok := completeQR.TryDequeue(); inflightBatch > 0 && ok; _, _, ok = completeQR.TryDequeue() {
+					for _, _, ok := completeQ.Reader.TryDequeue(); inflightBatch > 0 && ok; _, _, ok = completeQ.Reader.TryDequeue() {
 						inflightBatch--
 					}
 
 					if inflightBatch == maxPendingBatch {
-						completeQR.Dequeue()
+						completeQ.Reader.Dequeue()
 						inflightBatch--
 					}
 				}
@@ -62,11 +62,11 @@ func enqueueBP(concurrency, itemsPerGoroutine int) {
 				sendCounter++
 				var compQW *Writer[struct{}]
 				if sendCounter%itemsPerBatch == 0 {
-					compQW = completeQW
+					compQW = completeQ.Writer
 					inflightBatch++
 				}
 
-				destQW.Enqueue(compQW)
+				destQ.Writer.Enqueue(compQW)
 			}
 		}()
 	}

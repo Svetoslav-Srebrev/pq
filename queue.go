@@ -19,17 +19,9 @@ const (
 
 var ErrCanceled = errors.New("operation canceled")
 
-type slot[V any] struct {
-	data V
-	flag atomic.Uint32
-}
-
-type segment[V any] struct {
-	slots      [segmentSize]slot[V]
-	writeIndex atomic.Uint64
-	next       atomic.Pointer[segment[V]]
-	id         uint64
-	offset     uint64
+type Queue[V any] struct {
+	Writer *Writer[V]
+	Reader *Reader[V]
 }
 
 type Writer[V any] struct {
@@ -47,6 +39,19 @@ type Reader[V any] struct {
 	KeepData  bool
 }
 
+type segment[V any] struct {
+	slots      [segmentSize]slot[V]
+	writeIndex atomic.Uint64
+	next       atomic.Pointer[segment[V]]
+	id         uint64
+	offset     uint64
+}
+
+type slot[V any] struct {
+	data V
+	flag atomic.Uint32
+}
+
 type pendingCounter struct {
 	batch   int64
 	counter atomic.Int64
@@ -60,11 +65,11 @@ func (pc *pendingCounter) getCount() int {
 	return int(pc.counter.Load())
 }
 
-func NewQueue[V any]() (*Writer[V], *Reader[V]) {
+func NewQueue[V any]() Queue[V] {
 	return NewQueueWithStat[V](0)
 }
 
-func NewQueueWithStat[V any](batchIncrement int) (*Writer[V], *Reader[V]) {
+func NewQueueWithStat[V any](batchIncrement int) Queue[V] {
 	chReady := make(chan struct{}, 1)
 	seg := &segment[V]{}
 
@@ -77,7 +82,7 @@ func NewQueueWithStat[V any](batchIncrement int) (*Writer[V], *Reader[V]) {
 	qw.writeSegment.Store(seg)
 
 	qr := &Reader[V]{chReady: chReady, segment: seg, readIndex: 0, stat: pc}
-	return qw, qr
+	return Queue[V]{Writer: qw, Reader: qr}
 }
 
 func (qw *Writer[V]) Pending() int {

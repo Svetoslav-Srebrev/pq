@@ -122,11 +122,11 @@ func pipelinePQ(concurrency, itemsPerGoroutine int, resources []resource) {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	finalQW, finalQR := NewQueue[struct{}]()
+	finalQ := NewQueue[struct{}]()
 	go func() {
 		counter := 0
 		for {
-			finalQR.Dequeue()
+			finalQ.Reader.Dequeue()
 
 			resources[0].do()
 
@@ -138,19 +138,19 @@ func pipelinePQ(concurrency, itemsPerGoroutine int, resources []resource) {
 		}
 	}()
 
-	nextQW := finalQW
+	nextQW := finalQ.Writer
 	for i := 0; i < len(resources)-1; i++ {
-		curQW, curQR := NewQueue[struct{}]()
+		curQ := NewQueue[struct{}]()
 		go func(resourceIndex int, nqw *Writer[struct{}]) {
 			for {
-				item := curQR.Dequeue()
+				item := curQ.Reader.Dequeue()
 
 				resources[resourceIndex].do()
 
 				nqw.Enqueue(item)
 			}
 		}(i+1, nextQW)
-		nextQW = curQW
+		nextQW = curQ.Writer
 	}
 
 	for c := 0; c < concurrency; c++ {

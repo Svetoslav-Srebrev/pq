@@ -37,10 +37,10 @@ func BenchmarkReqRespQQ(b *testing.B) {
 }
 
 func reqRespQCh(concurrency, itemsPerGoroutine int) {
-	reqQW, reqQR := NewQueue[chan struct{}]()
+	reqQ := NewQueue[chan struct{}]()
 	go func() {
 		for {
-			complete := reqQR.Dequeue()
+			complete := reqQ.Reader.Dequeue()
 			complete <- struct{}{}
 		}
 	}()
@@ -51,7 +51,7 @@ func reqRespQCh(concurrency, itemsPerGoroutine int) {
 		go func() {
 			chComplete := make(chan struct{}, 1)
 			for i := 0; i < itemsPerGoroutine; i++ {
-				reqQW.Enqueue(chComplete)
+				reqQ.Writer.Enqueue(chComplete)
 				<-chComplete
 			}
 			wg.Done()
@@ -87,10 +87,10 @@ func reqRespCh(concurrency, itemsPerGoroutine int) {
 }
 
 func reqRespQQ(concurrency, itemsPerGoroutine int) {
-	reqQW, reqQR := NewQueue[*Writer[struct{}]]()
+	reqQ := NewQueue[*Writer[struct{}]]()
 	go func() {
 		for {
-			completeQW := reqQR.Dequeue()
+			completeQW := reqQ.Reader.Dequeue()
 			completeQW.Enqueue(struct{}{})
 		}
 	}()
@@ -99,10 +99,10 @@ func reqRespQQ(concurrency, itemsPerGoroutine int) {
 	for c := 0; c < concurrency; c++ {
 		wg.Add(1)
 		go func() {
-			completeQW, completeQR := NewQueue[struct{}]()
+			completeQ := NewQueue[struct{}]()
 			for i := 0; i < itemsPerGoroutine; i++ {
-				reqQW.Enqueue(completeQW)
-				completeQR.Dequeue()
+				reqQ.Writer.Enqueue(completeQ.Writer)
+				completeQ.Reader.Dequeue()
 			}
 			wg.Done()
 		}()
