@@ -39,6 +39,13 @@ type Reader[V any] struct {
 	KeepData  bool
 }
 
+type ReadRepeater[V any] struct {
+	reader    *Reader[V]
+	segment   *segment[V]
+	readIndex uint64
+	KeepData  bool
+}
+
 type segment[V any] struct {
 	slots      [segmentSize]slot[V]
 	writeIndex atomic.Uint64
@@ -163,6 +170,36 @@ func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, e
 		qr.segment.slots[index].data = zero
 	}
 	return offset, data, nil
+}
+
+func (qr *Reader[V]) KeepDataAndCreateRepeater() *ReadRepeater[V] {
+	qr.KeepData = true
+	return &ReadRepeater[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
+}
+
+func (r *ReadRepeater[V]) NextAvailable() (uint64, V, bool) {
+	dataAvailable := r.segment.offset < r.reader.segment.offset || r.readIndex < r.reader.readIndex
+	if !dataAvailable {
+		var zero V
+		return 0, zero, false
+	}
+
+	if r.readIndex == segmentSize {
+		next := r.segment.next.Load()
+		r.segment = next
+		r.readIndex = 0
+	}
+
+	index := r.readIndex
+	r.readIndex += 1
+	offset := r.segment.offset + index
+
+	data := r.segment.slots[index].data
+	if !r.KeepData {
+		var zero V
+		r.segment.slots[index].data = zero
+	}
+	return offset, data, true
 }
 
 func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {

@@ -32,6 +32,13 @@ type DynReader[V any] struct {
 	KeepData  bool
 }
 
+type DynReadRepeater[V any] struct {
+	reader    *DynReader[V]
+	segment   *dynSegment[V]
+	readIndex uint64
+	KeepData  bool
+}
+
 type dynSegment[V any] struct {
 	slots      []slot[V]
 	writeIndex atomic.Uint64
@@ -143,6 +150,36 @@ func DynDequeueWithCancel[V, C any](qr *DynReader[V], chCancel <-chan C) (uint64
 		qr.segment.slots[index].data = zero
 	}
 	return offset, data, nil
+}
+
+func (qr *DynReader[V]) KeepDataAndCreateRepeater() *DynReadRepeater[V] {
+	qr.KeepData = true
+	return &DynReadRepeater[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
+}
+
+func (r *DynReadRepeater[V]) NextAvailable() (uint64, V, bool) {
+	dataAvailable := r.segment.offset < r.reader.segment.offset || r.readIndex < r.reader.readIndex
+	if !dataAvailable {
+		var zero V
+		return 0, zero, false
+	}
+
+	if r.readIndex == uint64(len(r.segment.slots)) {
+		next := r.segment.next.Load()
+		r.segment = next
+		r.readIndex = 0
+	}
+
+	index := r.readIndex
+	r.readIndex += 1
+	offset := r.segment.offset + index
+
+	data := r.segment.slots[index].data
+	if !r.KeepData {
+		var zero V
+		r.segment.slots[index].data = zero
+	}
+	return offset, data, true
 }
 
 func (qr *DynReader[V]) dequeue(block bool) (uint64, V, bool) {
