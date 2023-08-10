@@ -44,6 +44,7 @@ type Reader[V any] struct {
 	readIndex uint64
 	chReady   <-chan struct{}
 	stat      *pendingCounter
+	KeepData  bool
 }
 
 type pendingCounter struct {
@@ -132,8 +133,8 @@ func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, e
 					// Consume qr.chReady to prevent next item from being read before it is first set.
 					<-qr.chReady
 				}
-				var zeroValue V
-				return 0, zeroValue, ErrCanceled
+				var zero V
+				return 0, zero, ErrCanceled
 
 			case <-qr.chReady:
 			}
@@ -151,7 +152,12 @@ func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, e
 		}
 	}
 
-	return offset, qr.segment.slots[index].data, nil
+	data := qr.segment.slots[index].data
+	if !qr.KeepData {
+		var zero V
+		qr.segment.slots[index].data = zero
+	}
+	return offset, data, nil
 }
 
 func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
@@ -166,8 +172,8 @@ func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
 	// index < segmentSize
 	if qr.segment.slots[qr.readIndex].flag.Load() != fReady {
 		if !block {
-			var zeroValue V
-			return 0, zeroValue, false
+			var zero V
+			return 0, zero, false
 		}
 
 		prev := qr.segment.slots[qr.readIndex].flag.Swap(fWaiting)
@@ -187,7 +193,12 @@ func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
 		}
 	}
 
-	return offset, qr.segment.slots[index].data, true
+	data := qr.segment.slots[index].data
+	if !qr.KeepData {
+		var zero V
+		qr.segment.slots[index].data = zero
+	}
+	return offset, data, true
 }
 
 func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
