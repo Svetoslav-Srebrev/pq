@@ -178,7 +178,7 @@ func (qr *Reader[V]) KeepDataAndCreateRepeater() *ReadRepeater[V] {
 }
 
 func (r *ReadRepeater[V]) NextAvailable() (uint64, V, bool) {
-	dataAvailable := r.segment.offset < r.reader.segment.offset || r.readIndex < r.reader.readIndex
+	dataAvailable := r.segment.offset+r.readIndex < r.reader.segment.offset+r.reader.readIndex
 	if !dataAvailable {
 		var zero V
 		return 0, zero, false
