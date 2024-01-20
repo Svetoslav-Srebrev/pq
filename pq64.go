@@ -1,6 +1,5 @@
 // Copyright (c) 2022, Svetoslav Srebrev <srebrev dot svetoslav at gmail dot com>. All rights reserved.
 // Use of this source code is governed by a 3-Clause license that can be found in the LICENSE file.
-
 package pq
 
 import (
@@ -9,107 +8,108 @@ import (
 )
 
 const (
-	defaultDynSegmentSize = 13
+	segmentSizeML = 64
 )
 
-type DynQueue[V any] struct {
-	Writer *DynWriter[V]
-	Reader *DynReader[V]
+type QueueML[V any] struct {
+	Writer *WriterML[V]
+	Reader *ReaderML[V]
 }
 
-type DynWriter[V any] struct {
-	writeSegment atomic.Pointer[dynSegment[V]]
-	mutex        *sync.Mutex
-	chReady      chan struct{}
-	stat         *pendingCounter
+type WriterML[V any] struct {
+	writeSegment  atomic.Pointer[segmentML[V]]
+	headSegment   *segmentML[V]
+	readSegmentId atomic.Uint64
+	mutex         *sync.Mutex
+	chReady       chan struct{}
+	stat          *pendingCounter
+	_pad          [1]byte
 }
 
-type DynReader[V any] struct {
-	segment   *dynSegment[V]
+type ReaderML[V any] struct {
+	segment   *segmentML[V]
 	readIndex uint64
+	writer    *WriterML[V]
 	chReady   <-chan struct{}
 	stat      *pendingCounter
 	KeepData  bool
 }
 
-type DynReadRepeater[V any] struct {
-	reader    *DynReader[V]
-	segment   *dynSegment[V]
+type ReadRepeaterML[V any] struct {
+	reader    *ReaderML[V]
+	segment   *segmentML[V]
 	readIndex uint64
 	KeepData  bool
 }
 
-type dynSegment[V any] struct {
-	slots      []slot[V]
+type segmentML[V any] struct {
+	slots      [segmentSizeML]slot[V]
 	writeIndex atomic.Uint64
-	next       atomic.Pointer[dynSegment[V]]
+	next       atomic.Pointer[segmentML[V]]
 	id         uint64
 	offset     uint64
 }
 
-func NewDynQueue[V any]() DynQueue[V] {
-	return NewDynQueueWithStat[V](defaultDynSegmentSize, 0)
+func NewQueueML[V any]() QueueML[V] {
+	return NewQueueWithStatML[V](0)
 }
 
-func NewDynQueueSized[V any](numSlots int) DynQueue[V] {
-	return NewDynQueueWithStat[V](numSlots, 0)
-}
-
-func NewDynQueueWithStat[V any](numSlots int, batchIncrement int) DynQueue[V] {
+func NewQueueWithStatML[V any](batchIncrement int) QueueML[V] {
 	chReady := make(chan struct{}, 1)
-	seg := &dynSegment[V]{}
-	seg.slots = make([]slot[V], numSlots)
+	seg := &segmentML[V]{}
 
 	var pc *pendingCounter
 	if batchIncrement > 0 {
 		pc = &pendingCounter{batch: int64(batchIncrement)}
 	}
 
-	qw := &DynWriter[V]{chReady: chReady, mutex: &sync.Mutex{}, stat: pc}
+	qw := &WriterML[V]{chReady: chReady, mutex: &sync.Mutex{}, stat: pc}
+	qw.headSegment = seg
 	qw.writeSegment.Store(seg)
 
-	qr := &DynReader[V]{chReady: chReady, segment: seg, readIndex: 0, stat: pc}
-	return DynQueue[V]{qw, qr}
+	qr := &ReaderML[V]{chReady: chReady, segment: seg, readIndex: 0, writer: qw, stat: pc}
+	return QueueML[V]{Writer: qw, Reader: qr}
 }
 
-func (qw *DynWriter[V]) Pending() int {
+func (qw *WriterML[V]) Pending() int {
 	return qw.stat.getCount()
 }
 
-func (qw *DynWriter[V]) Enqueue(value V) {
+func (qw *WriterML[V]) Enqueue(value V) {
 	qw.enqueue(value)
 }
 
-func (qw *DynWriter[V]) EnqueueWithIndex(value V) uint64 {
+func (qw *WriterML[V]) EnqueueWithIndex(value V) uint64 {
 	seg, index := qw.enqueue(value)
 	return seg.offset + index
 }
 
-func (qr *DynReader[V]) Pending() int {
+func (qr *ReaderML[V]) Pending() int {
 	return qr.stat.getCount()
 }
 
-func (qr *DynReader[V]) Dequeue() V {
+func (qr *ReaderML[V]) Dequeue() V {
 	_, val, _ := qr.dequeue(true)
 	return val
 }
 
-func (qr *DynReader[V]) DequeueWithIndex() (uint64, V) {
+func (qr *ReaderML[V]) DequeueWithIndex() (uint64, V) {
 	index, val, _ := qr.dequeue(true)
 	return index, val
 }
 
-func (qr *DynReader[V]) TryDequeue() (uint64, V, bool) {
+func (qr *ReaderML[V]) TryDequeue() (uint64, V, bool) {
 	return qr.dequeue(false)
 }
 
-func DynDequeueWithCancel[V, C any](qr *DynReader[V], chCancel <-chan C) (uint64, V, error) {
-	if qr.readIndex == uint64(len(qr.segment.slots)) {
+func DequeueWithCancelML[V, C any](qr *ReaderML[V], chCancel <-chan C) (uint64, V, error) {
+	if qr.readIndex == segmentSizeML {
 		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
 		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
 		qr.segment = next
 		qr.readIndex = 0
+		qr.writer.setReadSegmentId(next.id)
 	}
 
 	// index < segmentSize
@@ -133,6 +133,8 @@ func DynDequeueWithCancel[V, C any](qr *DynReader[V], chCancel <-chan C) (uint64
 		}
 	}
 
+	qr.segment.slots[qr.readIndex].flag.Store(fClear)
+
 	index := qr.readIndex
 	qr.readIndex += 1
 	offset := qr.segment.offset + index
@@ -152,19 +154,19 @@ func DynDequeueWithCancel[V, C any](qr *DynReader[V], chCancel <-chan C) (uint64
 	return offset, data, nil
 }
 
-func (qr *DynReader[V]) KeepDataAndCreateRepeater() *DynReadRepeater[V] {
+func (qr *ReaderML[V]) KeepDataAndCreateRepeater() *ReadRepeaterML[V] {
 	qr.KeepData = true
-	return &DynReadRepeater[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
+	return &ReadRepeaterML[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
 }
 
-func (r *DynReadRepeater[V]) NextAvailable() (uint64, V, bool) {
+func (r *ReadRepeaterML[V]) NextAvailable() (uint64, V, bool) {
 	dataAvailable := r.segment.offset+r.readIndex < r.reader.segment.offset+r.reader.readIndex
 	if !dataAvailable {
 		var zero V
 		return 0, zero, false
 	}
 
-	if r.readIndex == uint64(len(r.segment.slots)) {
+	if r.readIndex == segmentSizeML {
 		next := r.segment.next.Load()
 		r.segment = next
 		r.readIndex = 0
@@ -182,13 +184,14 @@ func (r *DynReadRepeater[V]) NextAvailable() (uint64, V, bool) {
 	return offset, data, true
 }
 
-func (qr *DynReader[V]) dequeue(block bool) (uint64, V, bool) {
-	if qr.readIndex == uint64(len(qr.segment.slots)) {
+func (qr *ReaderML[V]) dequeue(block bool) (uint64, V, bool) {
+	if qr.readIndex == segmentSizeML {
 		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
 		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
 		qr.segment = next
 		qr.readIndex = 0
+		qr.writer.setReadSegmentId(next.id)
 	}
 
 	// index < segmentSize
@@ -203,6 +206,8 @@ func (qr *DynReader[V]) dequeue(block bool) (uint64, V, bool) {
 			<-qr.chReady
 		}
 	}
+
+	qr.segment.slots[qr.readIndex].flag.Store(fClear)
 
 	index := qr.readIndex
 	qr.readIndex += 1
@@ -223,21 +228,26 @@ func (qr *DynReader[V]) dequeue(block bool) (uint64, V, bool) {
 	return offset, data, true
 }
 
-func (qw *DynWriter[V]) enqueue(value V) (*dynSegment[V], uint64) {
+func (qw *WriterML[V]) enqueue(value V) (*segmentML[V], uint64) {
 	seg := qw.writeSegment.Load()
 	var index uint64
 	for {
 		index = seg.writeIndex.Add(1) - 1
-		segSize := uint64(len(seg.slots))
-		if index < segSize {
-			if index == segSize-1 {
+		if index < segmentSizeML {
+			if index == segmentSizeML-1 {
 
 				qw.setNextSegment(seg)
 				//qw.setNextSegmentLockFree(seg)
 			}
 			break
 		} else {
-
+			//if seg.writeIndex.Load() < segmentSize {
+			//	index = seg.writeIndex.Add(1) - 1
+			//	if index < segmentSize {
+			//		break
+			//	}
+			//
+			//}
 			seg = qw.setNextSegment(seg)
 			//seg = qw.setNextSegmentLockFree(seg)
 		}
@@ -259,14 +269,33 @@ func (qw *DynWriter[V]) enqueue(value V) (*dynSegment[V], uint64) {
 	return seg, index
 }
 
-func (qw *DynWriter[V]) setNextSegment(seg *dynSegment[V]) *dynSegment[V] {
+func (qw *WriterML[V]) setNextSegment(seg *segmentML[V]) *segmentML[V] {
 	qw.mutex.Lock()
 	next := seg.next.Load()
 	if next == nil {
-		next = &dynSegment[V]{}
-		next.slots = make([]slot[V], len(seg.slots))
-		next.id = seg.id + 1
-		next.offset = next.id * uint64(len(seg.slots))
+		if seg.writeIndex.Load() < segmentSizeML {
+			qw.mutex.Unlock()
+			return seg
+		}
+
+		headSeg := qw.headSegment
+		if headSeg.id < qw.readSegmentId.Load() {
+			qw.headSegment = headSeg.next.Load()
+
+			segId := seg.id + 1
+			headSeg.id = segId
+			headSeg.offset = segId * segmentSizeML
+			headSeg.next.Store(nil)
+			headSeg.writeIndex.Store(0)
+
+			next = headSeg
+		} else {
+			next = &segmentML[V]{}
+			segId := seg.id + 1
+			next.id = segId
+			next.offset = segId * segmentSizeML
+		}
+
 		seg.next.Store(next)
 		qw.writeSegment.Store(next)
 
@@ -276,4 +305,8 @@ func (qw *DynWriter[V]) setNextSegment(seg *dynSegment[V]) *dynSegment[V] {
 	qw.mutex.Unlock()
 
 	return next
+}
+
+func (qw *WriterML[V]) setReadSegmentId(id uint64) {
+	qw.readSegmentId.Store(id)
 }

@@ -1,32 +1,24 @@
 // Copyright (c) 2022, Svetoslav Srebrev <srebrev dot svetoslav at gmail dot com>. All rights reserved.
 // Use of this source code is governed by a 3-Clause license that can be found in the LICENSE file.
-
 package pq
 
 import (
-	"errors"
 	"sync"
 	"sync/atomic"
 )
 
 const (
-	segmentSize = 64
-
-	fClear   = uint32(0)
-	fWaiting = uint32(1)
-	fReady   = uint32(2)
+	segmentSizeXS = 8
 )
 
-var ErrCanceled = errors.New("operation canceled")
-
-type Queue[V any] struct {
-	Writer *Writer[V]
-	Reader *Reader[V]
+type QueueXS[V any] struct {
+	Writer *WriterXS[V]
+	Reader *ReaderXS[V]
 }
 
-type Writer[V any] struct {
-	writeSegment  atomic.Pointer[segment[V]]
-	headSegment   *segment[V]
+type WriterXS[V any] struct {
+	writeSegment  atomic.Pointer[segmentXS[V]]
+	headSegment   *segmentXS[V]
 	readSegmentId atomic.Uint64
 	mutex         *sync.Mutex
 	chReady       chan struct{}
@@ -34,102 +26,84 @@ type Writer[V any] struct {
 	_pad          [1]byte
 }
 
-type Reader[V any] struct {
-	segment   *segment[V]
+type ReaderXS[V any] struct {
+	segment   *segmentXS[V]
 	readIndex uint64
-	writer    *Writer[V]
+	writer    *WriterXS[V]
 	chReady   <-chan struct{}
 	stat      *pendingCounter
 	KeepData  bool
 }
 
-type ReadRepeater[V any] struct {
-	reader    *Reader[V]
-	segment   *segment[V]
+type ReadRepeaterXS[V any] struct {
+	reader    *ReaderXS[V]
+	segment   *segmentXS[V]
 	readIndex uint64
 	KeepData  bool
 }
 
-type segment[V any] struct {
-	slots      [segmentSize]slot[V]
+type segmentXS[V any] struct {
+	slots      [segmentSizeXS]slot[V]
 	writeIndex atomic.Uint64
-	next       atomic.Pointer[segment[V]]
+	next       atomic.Pointer[segmentXS[V]]
 	id         uint64
 	offset     uint64
 }
 
-type slot[V any] struct {
-	data V
-	flag atomic.Uint32
+func NewQueueXS[V any]() QueueXS[V] {
+	return NewQueueWithStatXS[V](0)
 }
 
-type pendingCounter struct {
-	batch   int64
-	counter atomic.Int64
-}
-
-func (pc *pendingCounter) getCount() int {
-	if pc == nil {
-		return -1
-	}
-
-	return int(pc.counter.Load())
-}
-
-func NewQueue[V any]() Queue[V] {
-	return NewQueueWithStat[V](0)
-}
-
-func NewQueueWithStat[V any](batchIncrement int) Queue[V] {
+func NewQueueWithStatXS[V any](batchIncrement int) QueueXS[V] {
 	chReady := make(chan struct{}, 1)
-	seg := &segment[V]{}
+	seg := &segmentXS[V]{}
 
 	var pc *pendingCounter
 	if batchIncrement > 0 {
 		pc = &pendingCounter{batch: int64(batchIncrement)}
 	}
 
-	qw := &Writer[V]{chReady: chReady, mutex: &sync.Mutex{}, stat: pc}
+	qw := &WriterXS[V]{chReady: chReady, mutex: &sync.Mutex{}, stat: pc}
 	qw.headSegment = seg
 	qw.writeSegment.Store(seg)
 
-	qr := &Reader[V]{chReady: chReady, segment: seg, readIndex: 0, writer: qw, stat: pc}
-	return Queue[V]{Writer: qw, Reader: qr}
+	qr := &ReaderXS[V]{chReady: chReady, segment: seg, readIndex: 0, writer: qw, stat: pc}
+	return QueueXS[V]{Writer: qw, Reader: qr}
 }
 
-func (qw *Writer[V]) Pending() int {
+func (qw *WriterXS[V]) Pending() int {
 	return qw.stat.getCount()
 }
 
-func (qw *Writer[V]) Enqueue(value V) {
+func (qw *WriterXS[V]) Enqueue(value V) {
 	qw.enqueue(value)
 }
 
-func (qw *Writer[V]) EnqueueWithIndex(value V) uint64 {
+func (qw *WriterXS[V]) EnqueueWithIndex(value V) uint64 {
 	seg, index := qw.enqueue(value)
 	return seg.offset + index
 }
 
-func (qr *Reader[V]) Pending() int {
+func (qr *ReaderXS[V]) Pending() int {
 	return qr.stat.getCount()
 }
 
-func (qr *Reader[V]) Dequeue() V {
+func (qr *ReaderXS[V]) Dequeue() V {
 	_, val, _ := qr.dequeue(true)
 	return val
 }
 
-func (qr *Reader[V]) DequeueWithIndex() (uint64, V) {
+func (qr *ReaderXS[V]) DequeueWithIndex() (uint64, V) {
 	index, val, _ := qr.dequeue(true)
 	return index, val
 }
 
-func (qr *Reader[V]) TryDequeue() (uint64, V, bool) {
+func (qr *ReaderXS[V]) TryDequeue() (uint64, V, bool) {
 	return qr.dequeue(false)
 }
 
-func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, error) {
-	if qr.readIndex == segmentSize {
+func DequeueWithCancelXS[V, C any](qr *ReaderXS[V], chCancel <-chan C) (uint64, V, error) {
+	if qr.readIndex == segmentSizeXS {
 		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
 		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
@@ -180,19 +154,19 @@ func DequeueWithCancel[V, C any](qr *Reader[V], chCancel <-chan C) (uint64, V, e
 	return offset, data, nil
 }
 
-func (qr *Reader[V]) KeepDataAndCreateRepeater() *ReadRepeater[V] {
+func (qr *ReaderXS[V]) KeepDataAndCreateRepeater() *ReadRepeaterXS[V] {
 	qr.KeepData = true
-	return &ReadRepeater[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
+	return &ReadRepeaterXS[V]{reader: qr, segment: qr.segment, readIndex: qr.readIndex}
 }
 
-func (r *ReadRepeater[V]) NextAvailable() (uint64, V, bool) {
+func (r *ReadRepeaterXS[V]) NextAvailable() (uint64, V, bool) {
 	dataAvailable := r.segment.offset+r.readIndex < r.reader.segment.offset+r.reader.readIndex
 	if !dataAvailable {
 		var zero V
 		return 0, zero, false
 	}
 
-	if r.readIndex == segmentSize {
+	if r.readIndex == segmentSizeXS {
 		next := r.segment.next.Load()
 		r.segment = next
 		r.readIndex = 0
@@ -210,8 +184,8 @@ func (r *ReadRepeater[V]) NextAvailable() (uint64, V, bool) {
 	return offset, data, true
 }
 
-func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
-	if qr.readIndex == segmentSize {
+func (qr *ReaderXS[V]) dequeue(block bool) (uint64, V, bool) {
+	if qr.readIndex == segmentSizeXS {
 		// qr.segment.next is not nil at this point because previous segment slot seg.slots[segmentSize-1].flag
 		// was set which happens AFTER seg.next is set. See enqueue method
 		next := qr.segment.next.Load()
@@ -254,13 +228,13 @@ func (qr *Reader[V]) dequeue(block bool) (uint64, V, bool) {
 	return offset, data, true
 }
 
-func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
+func (qw *WriterXS[V]) enqueue(value V) (*segmentXS[V], uint64) {
 	seg := qw.writeSegment.Load()
 	var index uint64
 	for {
 		index = seg.writeIndex.Add(1) - 1
-		if index < segmentSize {
-			if index == segmentSize-1 {
+		if index < segmentSizeXS {
+			if index == segmentSizeXS-1 {
 
 				qw.setNextSegment(seg)
 				//qw.setNextSegmentLockFree(seg)
@@ -295,11 +269,11 @@ func (qw *Writer[V]) enqueue(value V) (*segment[V], uint64) {
 	return seg, index
 }
 
-func (qw *Writer[V]) setNextSegment(seg *segment[V]) *segment[V] {
+func (qw *WriterXS[V]) setNextSegment(seg *segmentXS[V]) *segmentXS[V] {
 	qw.mutex.Lock()
 	next := seg.next.Load()
 	if next == nil {
-		if seg.writeIndex.Load() < segmentSize {
+		if seg.writeIndex.Load() < segmentSizeXS {
 			qw.mutex.Unlock()
 			return seg
 		}
@@ -310,16 +284,16 @@ func (qw *Writer[V]) setNextSegment(seg *segment[V]) *segment[V] {
 
 			segId := seg.id + 1
 			headSeg.id = segId
-			headSeg.offset = segId * segmentSize
+			headSeg.offset = segId * segmentSizeXS
 			headSeg.next.Store(nil)
 			headSeg.writeIndex.Store(0)
 
 			next = headSeg
 		} else {
-			next = &segment[V]{}
+			next = &segmentXS[V]{}
 			segId := seg.id + 1
 			next.id = segId
-			next.offset = segId * segmentSize
+			next.offset = segId * segmentSizeXS
 		}
 
 		seg.next.Store(next)
@@ -333,6 +307,6 @@ func (qw *Writer[V]) setNextSegment(seg *segment[V]) *segment[V] {
 	return next
 }
 
-func (qw *Writer[V]) setReadSegmentId(id uint64) {
+func (qw *WriterXS[V]) setReadSegmentId(id uint64) {
 	qw.readSegmentId.Store(id)
 }
